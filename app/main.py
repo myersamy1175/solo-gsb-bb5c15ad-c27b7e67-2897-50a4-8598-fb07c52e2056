@@ -10,6 +10,7 @@ from . import database
 from .analyzer import CompatibilityError, analyze_compatibility
 from .encoder import EncodeError, encode_message
 from .fixtures import capture_snapshot, compare_snapshots, verify_expectation
+from .framing import FramingError, StreamDeframer
 from .parser import ParseError, parse_message
 from .schemas import (
     CompatibilityRequest,
@@ -19,6 +20,7 @@ from .schemas import (
     FixtureCreate,
     FixtureRunRequest,
     ParseRequest,
+    StreamParseRequest,
     validate_definition,
 )
 
@@ -306,6 +308,122 @@ def detect(req: DetectRequest):
             ],
         },
     )
+
+
+# ------------------------------------------------------------- stream framing
+
+
+class _FrameRejected(Exception):
+    """Internal: a framed candidate failed parsing or checksum verification.
+
+    Triggers one-byte resynchronization inside :class:`StreamDeframer`
+    instead of failing the whole request.
+    """
+
+
+def _decode_framing_hex(value: str, what: str) -> bytes:
+    """Decode a strict hex string for the framing endpoint.
+
+    Unlike /parse hex payloads, framing values reject separators/whitespace
+    and must contain whole bytes (an even number of digits).
+    """
+    if len(value) % 2:
+        raise HTTPException(
+            status_code=422,
+            detail=f"{what}: odd number of hex digits (whole bytes required)",
+        )
+    try:
+        return bytes.fromhex(value)
+    except ValueError:
+        raise HTTPException(
+            status_code=422,
+            detail=f"{what}: invalid hex (non-hex characters)",
+        )
+
+
+@app.post("/api/v1/stream/parse")
+def stream_parse(req: StreamParseRequest):
+    """Frame a chunked byte stream and parse every extracted frame.
+
+    ``chunks`` are concatenated in arrival order into a cross-chunk buffer;
+    frames are located by fixed sync bytes, and their total length (sync
+    included) is taken from an unsigned length field as
+    ``unsigned(length) + length_adjustment``. Each complete frame is parsed
+    with the existing parser (latest active version unless ``version`` is
+    given). Noise before a sync, an illegal length value or a
+    parse/checksum failure cause byte-by-byte resynchronization (reported in
+    ``discarded_ranges``); bytes of an unfinished frame are retained and
+    returned as ``incomplete_hex`` — never as an error. The retained buffer
+    is capped at 1 MiB and a single frame at 64 KiB (422 when exceeded).
+    """
+    record = _select_definition(req.device_type, req.version)
+
+    sync = _decode_framing_hex(req.sync_hex, "sync_hex")
+    if not sync:
+        raise HTTPException(status_code=422, detail="sync_hex must not be empty")
+
+    chunks: list[bytes] = []
+    for i, chunk_hex in enumerate(req.chunks):
+        chunk = _decode_framing_hex(chunk_hex, f"chunks[{i}]")
+        chunks.append(chunk)
+
+    def parse_frame(data: bytes) -> dict:
+        result = parse_message(record["fields"], record["checksum"], data)
+        # same acceptance rule as /detect: no trailing bits and, when a
+        # checksum is configured, it must verify.
+        if result["trailing_bits"]:
+            raise _FrameRejected(
+                f"definition does not fully consume the frame: "
+                f"{result['trailing_bits']} trailing bit(s)"
+            )
+        checksum = result["checksum"]
+        if record["checksum"] is not None:
+            if checksum is None:
+                raise _FrameRejected(
+                    f"checksum field '{record['checksum']['field']}' was not parsed "
+                    f"(skipped by an earlier branch)"
+                )
+            if not checksum["valid"]:
+                raise _FrameRejected(
+                    f"checksum mismatch: expected {checksum['expected_hex']}, "
+                    f"calculated {checksum['calculated_hex']}"
+                )
+        return {
+            "device_type": record["device_type"],
+            "version": record["version"],
+            "definition_active": record["active"],
+            **result,
+        }
+
+    deframer = StreamDeframer(
+        sync=sync,
+        length_field_offset=req.length_field_offset,
+        length_field_bytes=req.length_field_bytes,
+        length_endianness=req.length_endianness,
+        length_adjustment=req.length_adjustment,
+        parse_frame=parse_frame,
+    )
+    try:
+        for chunk in chunks:
+            deframer.add_chunk(chunk)
+        summary = deframer.finish()
+    except FramingError as exc:
+        raise HTTPException(status_code=422, detail=str(exc))
+
+    return {
+        "device_type": record["device_type"],
+        "version": record["version"],
+        "definition_active": record["active"],
+        "framing": {
+            "sync_hex": req.sync_hex.lower(),
+            "length_field_offset": req.length_field_offset,
+            "length_field_bytes": req.length_field_bytes,
+            "length_endianness": req.length_endianness,
+            "length_adjustment": req.length_adjustment,
+        },
+        "total_bytes": sum(len(c) for c in chunks),
+        **summary,
+    }
 
 
 @app.post("/api/v1/encode")

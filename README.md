@@ -1,6 +1,6 @@
 # 工业二进制报文解析 API
 
-基于 FastAPI 的工业二进制报文解析服务。用户注册**带版本的报文定义**（位宽、端序、条件分支、计数驱动的重复字段、校验字段），提交指定版本的十六进制报文后，服务按位解析、验证校验和，并返回字段值、位偏移及实际分支路径；反向地，也可以提交字段值**编码**出十六进制报文（校验和自动计算写入）。此外支持保存**解析回归样例**：把报文与基线字段快照存入 SQLite，版本升级后对新版本重跑并逐字段比对差异。SQLite 持久化，启动时自动建表。
+基于 FastAPI 的工业二进制报文解析服务。用户注册**带版本的报文定义**（位宽、端序、条件分支、计数驱动的重复字段、校验字段），提交指定版本的十六进制报文后，服务按位解析、验证校验和，并返回字段值、位偏移及实际分支路径；反向地，也可以提交字段值**编码**出十六进制报文（校验和自动计算写入）。对于串口 / TCP 式的**分块字节流**，还可通过 `/api/v1/stream/parse` 按同步字节与长度字段跨块分帧、噪声重同步并逐帧解析。此外支持保存**解析回归样例**：把报文与基线字段快照存入 SQLite，版本升级后对新版本重跑并逐字段比对差异。SQLite 持久化，启动时自动建表。
 
 ## 快速启动
 
@@ -80,6 +80,7 @@ docker compose up --build
 | POST | `/api/v1/definitions/{device_type}/{version}/deactivate` | 停用定义 |
 | POST | `/api/v1/definitions/{device_type}/compatibility` | 两个已注册版本的报文布局兼容性分析（>256 个等价类组合或任一版本含 `repeat` 定义返回 422） |
 | POST | `/api/v1/parse` | 解析报文（`version` 缺省时使用最新启用版本） |
+| POST | `/api/v1/stream/parse` | 字节流分帧：跨 chunk 维护缓冲，按同步字节+长度字段切出多帧并逐帧解析，自动重同步 |
 | POST | `/api/v1/detect` | 不传版本，用全部已注册版本（含停用）逐一解析以自动识别版本 |
 | POST | `/api/v1/encode` | 反向编码：由字段值生成报文（版本选择规则同 parse） |
 | POST | `/api/v1/fixtures` | 保存带名称的解析回归样例（名称在**设备类型内**唯一，重复返回 409） |
@@ -149,7 +150,85 @@ curl -X POST http://localhost:8000/api/v1/parse \
 
 湿度分支报文（`msg_type=2`，湿度 0x55=85%）：`aa2055ba77`。校验和错误时仍返回 200，但 `checksum.valid` 为 `false`；报文过短或 hex 非法返回 422。
 
-### 3. 编码报文（解析的逆操作）
+### 3. 字节流分帧解析（/stream/parse）
+
+串口 / TCP 等链路上报文以**连续字节流**到达：帧可能在任意位置被拆成多个 chunk，帧间还可能夹杂噪声。`/api/v1/stream/parse` 在一次请求内按 `chunks` 的到达顺序维护**跨块缓冲**，先分帧、再逐帧调用现有解析器：
+
+- **帧头同步**：每帧以固定的同步字节 `sync_hex`（如 `"aa55"`）开头；
+- **长度字段**：帧头内有一个**无符号整数字段**，由 `length_field_offset`（相对帧头/同步字节的字节偏移）、`length_field_bytes`（1～8 字节）、`length_endianness`（`big`/`little`）描述；
+- **总帧长**（含同步字节本身）= `unsigned(长度字段) + length_adjustment`（长度字段按“payload 字节数”计数、不含帧头时 `length_adjustment` 为帧头字节数）；
+- **逐帧解析**：每凑齐一帧即按 `device_type`/`version`（版本缺省同 `/parse`，取最新启用版本）调用现有解析器，接受规则同 `/detect`——定义须**完整消费**整帧（无尾部位），且配置了校验和时必须校验通过。
+
+**重同步**：以下情况不会使整个请求失败，而是记录到 `discarded_ranges` 后**逐字节**前进、寻找下一个同步字节：
+
+- 同步字节之前的噪声字节；
+- 长度字段解出的总帧长 ≤ 0（非法长度）；
+- 帧解析失败（报文过短、重复计数超界等）或校验和不符。
+
+**未完成帧不算错误**：请求结束时缓冲中剩余的字节（半截同步字、长度字段不全、帧体不全）原样以 `incomplete_hex` 返回；这些字节可能只是下一帧的开头，调用方拿到后续数据后重新发起请求即可。
+
+**保护上限**：跨块保留缓冲最大 **1 MiB**（持续找不到可消费帧时）、单帧最大 **64 KiB**（长度字段宣告值过大时），超限返回 **422**（协议级失败，不做重同步）。上限只约束**未消费的保留字节**，已切出的帧不计入——连续解析远超 1 MiB 的正常流量没有问题。
+
+```bash
+# 帧格式: AA <总帧长 uint8> <payload...> <xor8 校验前面全部字节>
+# 示例流: 噪声 2 字节 + 帧(aa0411bf) + 帧(aa0422..) 的前半截
+curl -X POST http://localhost:8000/api/v1/stream/parse \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "device_type": "stream_dev",
+    "sync_hex": "aa",
+    "length_field_offset": 1,
+    "length_field_bytes": 1,
+    "length_endianness": "big",
+    "length_adjustment": 0,
+    "chunks": ["00ffaa0411bf", "aa0422"]
+  }'
+```
+
+响应：
+
+```json
+{
+  "device_type": "stream_dev",
+  "version": "1.0.0",
+  "definition_active": true,
+  "framing": {
+    "sync_hex": "aa",
+    "length_field_offset": 1,
+    "length_field_bytes": 1,
+    "length_endianness": "big",
+    "length_adjustment": 0
+  },
+  "total_bytes": 9,
+  "frames": [
+    {
+      "start": 2,
+      "end": 6,
+      "hex": "aa0411bf",
+      "result": {
+        "device_type": "stream_dev",
+        "version": "1.0.0",
+        "fields": [ {"name": "header", "bit_offset": 0, "value": 170}, "..."],
+        "checksum": {"field": "cs", "algorithm": "xor8", "valid": true},
+        "trailing_bits": 0
+      }
+    }
+  ],
+  "discarded_ranges": [
+    {"start": 0, "end": 2, "hex": "00ff", "reason": "leading noise"}
+  ],
+  "incomplete_hex": "aa0422",
+  "frames_parsed": 1,
+  "discarded_bytes": 2
+}
+```
+
+- `frames[].start` / `frames[].end` 为该帧在本次请求**拼接后字节流**中的原始起止偏移（`[start, end)` 半开区间，首字节偏移为 0），`frames[].hex` 为帧原始字节，`frames[].result` 与 `/parse` 响应结构一致。
+- `discarded_ranges[]` 给出每段被丢弃字节的 `start`/`end`/`hex` 及 `reason`（`leading noise`、`illegal length field`、`frame parse/checksum failure` 等；相邻丢弃段自动合并）。
+- `chunks` 为十六进制字符串数组，按顺序拼接；每个元素都必须是**偶数位**纯 hex（不做空白/分隔符清洗，非法或奇数位返回 422），允许空数组（返回空结果）。`sync_hex` 同样为偶数位非空纯 hex。
+- `length_field_bytes` 取值 1～8；`length_adjustment` 可为负（如长度字段把帧头也算入总时长时）。
+
+### 4. 编码报文（解析的逆操作）
 
 提交字段值，服务按位宽连续写入（支持非字节对齐、大小端、`int` 补码），自动计算并写入校验字段，返回 `hex`、实际编码字段和分支路径：
 
@@ -191,7 +270,7 @@ curl -X POST http://localhost:8000/api/v1/encode \
 - 条件判断统一使用 **raw**（与 parse 一致）：条件未命中的字段不要求输入（提供了也返回 422）；命中字段缺失、出现未知字段均返回 422。
 - 校验字段**不接受调用方赋值**，服务在其位置自动计算写入；校验位置未字节对齐时返回 422。
 
-### 4. 重复字段（repeat）：变长数组
+### 5. 重复字段（repeat）：变长数组
 
 定义中 `count` 是普通 uint 字段，`samples` 通过 `repeat` 声明由它的原始值决定重复次数（上限 8）：
 
@@ -267,7 +346,7 @@ curl -X POST http://localhost:8000/api/v1/encode \
 
 返回 422 的情形：运行时计数超过声明的 `max`、编码数组长度与计数不一致（或不是数组）、重复段超出报文长度、计数字段被更早的条件分支跳过。注册时若计数引用不是前置标量 `uint`、`max` 不在 1～64、重复字段被后续条件引用或校验字段声明为重复，同样返回 422。
 
-### 5. 列表 / 最新版本 / 停用
+### 6. 列表 / 最新版本 / 停用
 
 ```bash
 # 列出全部启用中的定义（可加 ?device_type=temp_sensor 或 ?include_inactive=true）
@@ -280,7 +359,7 @@ curl http://localhost:8000/api/v1/definitions/temp_sensor/latest
 curl -X POST http://localhost:8000/api/v1/definitions/temp_sensor/1.0.0/deactivate
 ```
 
-### 6. 版本兼容性分析
+### 7. 版本兼容性分析
 
 比较同一 `device_type` 的两个**已注册**版本（无需提供报文）。分析器：
 
@@ -345,7 +424,7 @@ curl -X POST http://localhost:8000/api/v1/definitions/temp_sensor/compatibility 
 
 两版本对同一控制字段的位宽不同时，按两者原始值域的**交集**划分（无交集返回 422）；新版新增控制字段或删除旧控制字段时，仅在受影响的等价类上产生差异，未受影响分支仍可判为兼容。
 
-### 7. 自动识别版本（/detect）
+### 8. 自动识别版本（/detect）
 
 收到报文但不知道版本时，调用 `/api/v1/detect`。请求体**只含** `device_type` 与 `hex`（不接受 `version`，多余字段返回 422）；服务会取出该设备类型下**全部已注册版本（含停用版本）**，按版本顺序逐一解析：
 
@@ -406,7 +485,7 @@ curl -X POST http://localhost:8000/api/v1/detect \
 
 > 设备类型下没有任何注册版本（含停用）时返回 `404`；hex 非法/为空返回 `422`，清洗规则与 `/parse` 一致（忽略空白、`_`、`-` 与 `0x` 前缀）。
 
-### 8. 解析回归样例（/fixtures）
+### 9. 解析回归样例（/fixtures）
 
 报文定义升级后，需要确认同一批历史报文在新版本上的解析表现。回归样例把一条报文与它在某个版本上的**字段快照**绑定存储（SQLite），随后可对任意目标版本（或默认的基线版本）重跑，逐字段比较：
 
@@ -548,6 +627,7 @@ app/
   main.py       # FastAPI 路由与生命周期
   schemas.py    # 请求模型与定义语义校验
   parser.py     # 按位解析器（位读取、条件分支、repeat 数组展开、校验和验证）
+  framing.py    # 字节流分帧（跨 chunk 缓冲、同步字定位、长度字段定帧、逐字节重同步、1MiB/64KiB 上限）
   encoder.py    # 按位编码器（位写入、scale/offset 反算、repeat 数组、校验和自动写入）
   analyzer.py   # 版本兼容性分析（条件等价类划分、可达分支枚举、布局比对；遇 repeat 拒绝分析）
   fixtures.py   # 回归样例：基线快照捕获、expect 断言、逐字段 added/removed/changed 比较

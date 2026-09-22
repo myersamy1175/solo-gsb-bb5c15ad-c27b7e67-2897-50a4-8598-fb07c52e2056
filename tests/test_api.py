@@ -1901,3 +1901,405 @@ def test_fixture_snapshot_covers_bool_and_repeated_fields():
     assert resp.status_code == 200
     assert resp.json()["passed"] is True
     assert resp.json()["comparison"]["pass_rate"] == 1.0
+
+
+# ------------------------------------------------------------- stream framing
+
+
+# wire frame for stream_dev: AA <total-len uint8> <payload bytes> <xor8 prefix>
+# definition: header=0xAA (8), len (8), val (8 per payload byte via repeats
+# is unsupported for checksum, so use a fixed 1-payload-byte layout)
+STREAM_DEF = {
+    "device_type": "stream_dev",
+    "version": "1.0.0",
+    "description": "字节流分帧测试设备",
+    "fields": [
+        {"name": "header", "type": "uint", "bit_length": 8},
+        {"name": "length", "type": "uint", "bit_length": 8},
+        {"name": "val", "type": "uint", "bit_length": 8},
+        {"name": "cs", "type": "uint", "bit_length": 8},
+    ],
+    "checksum": {"field": "cs", "algorithm": "xor8"},
+}
+
+# multi-byte sync + 16-bit big-endian length-prefix-of-total variant
+STREAM_SYNC2_DEF = {
+    "device_type": "stream_sync2",
+    "version": "1.0.0",
+    "fields": [
+        {"name": "b0", "type": "uint", "bit_length": 8},
+        {"name": "b1", "type": "uint", "bit_length": 8},
+        {"name": "length", "type": "uint", "bit_length": 16},
+        {"name": "val", "type": "uint", "bit_length": 8},
+        {"name": "cs", "type": "uint", "bit_length": 8},
+    ],
+    "checksum": {"field": "cs", "algorithm": "xor8"},
+}
+
+
+def _xor_frame(body: bytes) -> bytes:
+    from app.checksum import xor8
+    return body + bytes([xor8(body)])
+
+
+def _register_stream_devices():
+    resp = client.post("/api/v1/definitions", json=STREAM_DEF)
+    assert resp.status_code == 201, resp.text
+    resp = client.post("/api/v1/definitions", json=STREAM_SYNC2_DEF)
+    assert resp.status_code == 201, resp.text
+
+
+STREAM_PARAMS = {
+    "sync_hex": "aa",
+    "length_field_offset": 1,
+    "length_field_bytes": 1,
+    "length_endianness": "big",
+    "length_adjustment": 0,
+}
+
+
+def test_stream_parse_frames_split_across_chunks():
+    _register_stream_devices()
+    f1 = _xor_frame(bytes([0xAA, 0x04, 0x11]))
+    f2 = _xor_frame(bytes([0xAA, 0x04, 0x22]))
+    stream = f1 + f2
+    # split mid-frame and mid-sync
+    chunks = [stream[:2].hex(), stream[2:7].hex(), stream[7:].hex()]
+
+    resp = client.post(
+        "/api/v1/stream/parse",
+        json={"device_type": "stream_dev", "chunks": chunks, **STREAM_PARAMS},
+    )
+    assert resp.status_code == 200, resp.text
+    data = resp.json()
+    assert data["total_bytes"] == 8
+    assert data["frames_parsed"] == 2
+    assert data["discarded_bytes"] == 0
+    assert data["incomplete_hex"] == ""
+    assert data["framing"]["sync_hex"] == "aa"
+
+    first, second = data["frames"]
+    assert (first["start"], first["end"]) == (0, 4)
+    assert first["hex"] == f1.hex()
+    assert first["result"]["version"] == "1.0.0"
+    assert first["result"]["checksum"]["valid"] is True
+    assert first["result"]["trailing_bits"] == 0
+    vals = {f["name"]: f for f in first["result"]["fields"]}
+    assert vals["val"]["value"] == 0x11
+    assert (second["start"], second["end"]) == (4, 8)
+    assert {f["name"]: f for f in second["result"]["fields"]}["val"]["value"] == 0x22
+
+
+def test_stream_parse_leading_noise_is_discarded():
+    f1 = _xor_frame(bytes([0xAA, 0x04, 0x33]))
+    resp = client.post(
+        "/api/v1/stream/parse",
+        json={"device_type": "stream_dev",
+              "chunks": [("00ff" + f1.hex())], **STREAM_PARAMS},
+    )
+    assert resp.status_code == 200, resp.text
+    data = resp.json()
+    assert data["frames_parsed"] == 1
+    assert data["frames"][0]["start"] == 2
+    discarded = data["discarded_ranges"]
+    assert len(discarded) == 1
+    assert (discarded[0]["start"], discarded[0]["end"]) == (0, 2)
+    assert discarded[0]["hex"] == "00ff"
+    assert "noise" in discarded[0]["reason"]
+
+
+def test_stream_parse_illegal_length_resynchronizes():
+    # AA 00 cannot describe a frame (total length 0): two bytes discarded,
+    # then a valid frame follows
+    good = _xor_frame(bytes([0xAA, 0x04, 0x44]))
+    resp = client.post(
+        "/api/v1/stream/parse",
+        json={"device_type": "stream_dev",
+              "chunks": ["aa00" + good.hex()], **STREAM_PARAMS},
+    )
+    assert resp.status_code == 200, resp.text
+    data = resp.json()
+    assert data["frames_parsed"] == 1
+    assert (data["frames"][0]["start"], data["frames"][0]["end"]) == (2, 6)
+    discarded = data["discarded_ranges"]
+    assert len(discarded) == 1
+    assert (discarded[0]["start"], discarded[0]["end"]) == (0, 2)
+    assert discarded[0]["hex"] == "aa00"
+    assert "illegal length" in discarded[0]["reason"]
+
+
+def test_stream_parse_bad_checksum_resynchronizes_byte_by_byte():
+    from app.checksum import xor8
+    good = _xor_frame(bytes([0xAA, 0x04, 0x55]))
+    # corrupt the checksum byte of the first candidate; the scanner must skip
+    # it one byte at a time and eventually sync on the real following frame.
+    body = bytes([0xAA, 0x04, 0x55])
+    corrupt = body + bytes([xor8(body) ^ 0xFF])
+    stream = corrupt + good
+    resp = client.post(
+        "/api/v1/stream/parse",
+        json={"device_type": "stream_dev", "chunks": [stream.hex()], **STREAM_PARAMS},
+    )
+    assert resp.status_code == 200, resp.text
+    data = resp.json()
+    assert data["frames_parsed"] == 1
+    assert data["frames"][0]["start"] == 4
+    # bytes 0..3 (the corrupt frame) were skipped one at a time
+    assert data["discarded_bytes"] == 4
+    assert all(
+        rng["end"] - rng["start"] >= 1 for rng in data["discarded_ranges"]
+    )
+
+
+def test_stream_parse_trailing_incomplete_frame_is_not_an_error():
+    full = _xor_frame(bytes([0xAA, 0x04, 0x66]))
+    next_frame = _xor_frame(bytes([0xAA, 0x04, 0x77]))
+    partial = next_frame[:3]  # checksum byte of the second frame missing
+
+    # request ending mid-frame: leftover bytes reported, never an error
+    resp = client.post(
+        "/api/v1/stream/parse",
+        json={"device_type": "stream_dev",
+              "chunks": [(full + partial).hex()], **STREAM_PARAMS},
+    )
+    assert resp.status_code == 200, resp.text
+    data = resp.json()
+    assert data["frames_parsed"] == 1
+    assert data["discarded_bytes"] == 0
+    assert data["incomplete_hex"] == partial.hex()
+
+    # the missing byte arriving in a later chunk of the same request
+    # completes the second frame
+    resp = client.post(
+        "/api/v1/stream/parse",
+        json={"device_type": "stream_dev",
+              "chunks": [(full + partial).hex(), next_frame[3:].hex()],
+              **STREAM_PARAMS},
+    )
+    assert resp.status_code == 200, resp.text
+    data = resp.json()
+    assert data["frames_parsed"] == 2
+    assert data["incomplete_hex"] == ""
+    assert data["frames"][1]["start"] == 4
+
+
+def test_stream_parse_multibyte_sync_keeps_tail_prefix():
+    # frame: AA 55 <len16 BE = total 6> <val> <xor8 over first 5 bytes>
+    body = bytes([0xAA, 0x55, 0x00, 0x06, 0x88])
+    frame = _xor_frame(body)
+
+    # trailing lone 0xAA could be the first sync byte of the next frame
+    resp = client.post(
+        "/api/v1/stream/parse",
+        json={
+            "device_type": "stream_sync2",
+            "sync_hex": "aa55",
+            "length_field_offset": 2,
+            "length_field_bytes": 2,
+            "length_endianness": "big",
+            "length_adjustment": 0,
+            "chunks": [("0102" + frame.hex() + "aa")],
+        },
+    )
+    assert resp.status_code == 200, resp.text
+    data = resp.json()
+    assert data["frames_parsed"] == 1
+    assert (data["frames"][0]["start"], data["frames"][0]["end"]) == (2, 8)
+    assert data["discarded_ranges"][0]["hex"] == "0102"
+    assert data["incomplete_hex"] == "aa"  # prefix retained, not discarded
+
+
+def test_stream_parse_little_endian_length_and_adjustment():
+    # device with sync at 0, a 2-byte LE length field at offset 1 that counts
+    # the payload only; header is sync(1)+len(2)+cs(1)=4 bytes, so adjustment=4.
+    # Register a matching definition: sync 8, len low/high 16 LE, val 8, cs 8.
+    client.post(
+        "/api/v1/definitions",
+        json={
+            "device_type": "stream_le",
+            "version": "1.0.0",
+            "fields": [
+                {"name": "header", "type": "uint", "bit_length": 8},
+                {"name": "length", "type": "uint", "bit_length": 16, "endianness": "little"},
+                {"name": "val", "type": "uint", "bit_length": 8},
+                {"name": "cs", "type": "uint", "bit_length": 8},
+            ],
+            "checksum": {"field": "cs", "algorithm": "xor8"},
+        },
+    )
+    # length = 1 payload byte; total = 5
+    body = bytes([0xAA, 0x01, 0x00, 0x99])
+    frame = _xor_frame(body)
+    resp = client.post(
+        "/api/v1/stream/parse",
+        json={
+            "device_type": "stream_le",
+            "sync_hex": "aa",
+            "length_field_offset": 1,
+            "length_field_bytes": 2,
+            "length_endianness": "little",
+            "length_adjustment": 4,
+            "chunks": [frame.hex()],
+        },
+    )
+    assert resp.status_code == 200, resp.text
+    data = resp.json()
+    assert data["frames_parsed"] == 1
+    assert (data["frames"][0]["start"], data["frames"][0]["end"]) == (0, 5)
+    assert data["frames"][0]["result"]["fields"][2]["value"] == 0x99
+
+
+def test_stream_parse_frame_over_64kib_returns_422():
+    # 3-byte big-endian length field advertising 70000 total bytes
+    resp = client.post(
+        "/api/v1/stream/parse",
+        json={
+            "device_type": "stream_dev",
+            "sync_hex": "aa",
+            "length_field_offset": 1,
+            "length_field_bytes": 3,
+            "length_endianness": "big",
+            "length_adjustment": 0,
+            "chunks": [("aa" + (70000).to_bytes(3, "big").hex())],
+        },
+    )
+    assert resp.status_code == 422
+    assert "65536" in resp.json()["detail"]
+
+
+def test_stream_parse_buffer_over_1mib_returns_422():
+    # stream without any sync byte: buffered noise grows past 1 MiB
+    noise = "00" * (1024 * 1024 + 1)
+    resp = client.post(
+        "/api/v1/stream/parse",
+        json={"device_type": "stream_dev", "chunks": [noise], **STREAM_PARAMS},
+    )
+    assert resp.status_code == 422
+    detail = resp.json()["detail"]
+    assert "1048576" in detail
+
+
+def test_stream_parse_buffer_cap_not_tripped_by_consumed_frames():
+    # The 1 MiB cap bounds *retained* (unconsumed) bytes, not the cumulative
+    # input. That property belongs to the deframer itself (exercising it over
+    # HTTP with hundreds of thousands of full parse results would make the
+    # API test suite needlessly slow).
+    from app.framing import StreamDeframer
+
+    deframer = StreamDeframer(
+        sync=b"\xaa",
+        length_field_offset=1,
+        length_field_bytes=1,
+        length_endianness="big",
+        length_adjustment=0,
+        parse_frame=lambda data: {"ok": True},
+    )
+    frame = b"\xaa\x04\x01\xab"  # 4 bytes each; parser is a cheap stub
+    for _ in range(300000):  # 1.2 MiB total
+        deframer.add_chunk(frame)
+    summary = deframer.finish()
+    assert summary["frames_parsed"] == 300000
+    assert summary["discarded_bytes"] == 0
+    assert summary["incomplete_hex"] == ""
+
+
+def test_stream_parse_invalid_requests():
+    # invalid hex in a chunk
+    resp = client.post(
+        "/api/v1/stream/parse",
+        json={"device_type": "stream_dev", "chunks": ["zz"], **STREAM_PARAMS},
+    )
+    assert resp.status_code == 422
+
+    # odd number of hex digits in a chunk
+    resp = client.post(
+        "/api/v1/stream/parse",
+        json={"device_type": "stream_dev", "chunks": ["aaa"], **STREAM_PARAMS},
+    )
+    assert resp.status_code == 422
+    assert "whole bytes" in resp.json()["detail"]
+
+    # invalid sync hex
+    resp = client.post(
+        "/api/v1/stream/parse",
+        json={"device_type": "stream_dev", "sync_hex": "zz",
+              "length_field_offset": 1, "length_field_bytes": 1, "chunks": []},
+    )
+    assert resp.status_code == 422
+
+    # length_field_bytes out of range
+    resp = client.post(
+        "/api/v1/stream/parse",
+        json={"device_type": "stream_dev", "sync_hex": "aa",
+              "length_field_offset": 1, "length_field_bytes": 9, "chunks": []},
+    )
+    assert resp.status_code == 422
+
+    # unknown field rejected (extra="forbid")
+    resp = client.post(
+        "/api/v1/stream/parse",
+        json={"device_type": "stream_dev", "chunks": [],
+              "unexpected": 1, **STREAM_PARAMS},
+    )
+    assert resp.status_code == 422
+
+
+def test_stream_parse_empty_chunks_ok_and_unknown_device_404():
+    resp = client.post(
+        "/api/v1/stream/parse",
+        json={"device_type": "stream_dev", "chunks": [], **STREAM_PARAMS},
+    )
+    assert resp.status_code == 200, resp.text
+    data = resp.json()
+    assert data["frames"] == []
+    assert data["discarded_ranges"] == []
+    assert data["incomplete_hex"] == ""
+    assert data["total_bytes"] == 0
+
+    resp = client.post(
+        "/api/v1/stream/parse",
+        json={"device_type": "ghost", "chunks": [], **STREAM_PARAMS},
+    )
+    assert resp.status_code == 404
+
+
+def test_stream_parse_uses_latest_version_by_default():
+    # register a 2.0.0 with the same wire layout; default selection must pick it
+    client.post(
+        "/api/v1/definitions",
+        json={**STREAM_DEF, "version": "2.0.0", "description": ""},
+    )
+    frame = _xor_frame(bytes([0xAA, 0x04, 0xAB]))
+    resp = client.post(
+        "/api/v1/stream/parse",
+        json={"device_type": "stream_dev", "chunks": [frame.hex()], **STREAM_PARAMS},
+    )
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["version"] == "2.0.0"
+
+    # explicit older version is still selectable
+    resp = client.post(
+        "/api/v1/stream/parse",
+        json={"device_type": "stream_dev", "version": "1.0.0",
+              "chunks": [frame.hex()], **STREAM_PARAMS},
+    )
+    assert resp.status_code == 200
+    assert resp.json()["version"] == "1.0.0"
+
+
+def test_stream_parse_noise_garbage_between_two_frames():
+    f1 = _xor_frame(bytes([0xAA, 0x04, 0x01]))
+    f2 = _xor_frame(bytes([0xAA, 0x04, 0x02]))
+    stream = f1 + b"\x7f\x12\x34" + f2
+    resp = client.post(
+        "/api/v1/stream/parse",
+        json={"device_type": "stream_dev", "chunks": [stream.hex()], **STREAM_PARAMS},
+    )
+    assert resp.status_code == 200, resp.text
+    data = resp.json()
+    assert data["frames_parsed"] == 2
+    assert data["frames"][0]["start"] == 0
+    assert data["frames"][1]["start"] == 7
+    assert data["discarded_bytes"] == 3
+    assert data["discarded_ranges"][0]["start"] == 4
+    assert data["discarded_ranges"][0]["end"] == 7

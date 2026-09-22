@@ -58,6 +58,31 @@ class DetectRequest(BaseModel):
     hex: str = Field(min_length=2)
 
 
+class StreamParseRequest(BaseModel):
+    """POST /api/v1/stream/parse: frame a chunked byte stream, then parse
+    every extracted frame against one definition."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    device_type: str = Field(min_length=1, max_length=128)
+    # omitted -> latest active version (same rule as /parse)
+    version: Optional[str] = Field(default=None, min_length=1, max_length=64)
+    # fixed frame-header sync bytes, hex (e.g. "AA55"); must be non-empty
+    sync_hex: str = Field(min_length=1)
+    # byte offset of the unsigned length field relative to the frame start
+    # (the sync bytes); the whole field must lie inside the frame header
+    length_field_offset: int = Field(ge=0, le=64 * 1024)
+    # width of the unsigned length field in bytes (1..8)
+    length_field_bytes: int = Field(ge=1, le=8)
+    length_endianness: Literal["big", "little"] = "big"
+    # total frame length = unsigned(length field) + length_adjustment
+    # (negative when the length value counts part of the header as well)
+    length_adjustment: int = 0
+    # hex chunks in arrival order; each entry must decode to whole bytes
+    # (even number of hex digits). The list itself may be empty.
+    chunks: List[str] = Field(default_factory=list)
+
+
 class EncodeRequest(BaseModel):
     device_type: str
     version: Optional[str] = None  # omitted -> latest active version
