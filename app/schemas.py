@@ -58,6 +58,32 @@ class DetectRequest(BaseModel):
     hex: str = Field(min_length=2)
 
 
+class StreamParseRequest(BaseModel):
+    # Reassemble a chunked byte stream, frame it by a sync marker + unsigned
+    # length field, and parse every complete frame.
+    model_config = ConfigDict(extra="forbid")
+
+    device_type: str = Field(min_length=1, max_length=128)
+    version: Optional[str] = None  # omitted -> latest active version
+    sync_hex: str = Field(min_length=2, description="frame-header sync bytes, e.g. 'AA55'")
+    length_field_offset: int = Field(
+        ge=0, le=64 * 1024 - 1,
+        description="bytes between the sync marker and the length field",
+    )
+    length_field_bytes: int = Field(
+        ge=1, le=8, description="width of the unsigned length field"
+    )
+    length_endianness: Literal["big", "little"] = "big"
+    length_adjustment: int = Field(
+        default=0, ge=-(2 ** 31), le=2 ** 31 - 1,
+        description="signed correction added when computing total frame length",
+    )
+    chunks: List[str] = Field(
+        default_factory=list,
+        description="hex payload chunks in stream order; frames may span chunks",
+    )
+
+
 class EncodeRequest(BaseModel):
     device_type: str
     version: Optional[str] = None  # omitted -> latest active version

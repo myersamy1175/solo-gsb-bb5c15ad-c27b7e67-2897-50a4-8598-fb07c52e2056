@@ -1,6 +1,6 @@
 # 工业二进制报文解析 API
 
-基于 FastAPI 的工业二进制报文解析服务。用户注册**带版本的报文定义**（位宽、端序、条件分支、计数驱动的重复字段、校验字段），提交指定版本的十六进制报文后，服务按位解析、验证校验和，并返回字段值、位偏移及实际分支路径；反向地，也可以提交字段值**编码**出十六进制报文（校验和自动计算写入）。此外支持保存**解析回归样例**：把报文与基线字段快照存入 SQLite，版本升级后对新版本重跑并逐字段比对差异。SQLite 持久化，启动时自动建表。
+基于 FastAPI 的工业二进制报文解析服务。用户注册**带版本的报文定义**（位宽、端序、条件分支、计数驱动的重复字段、校验字段），提交指定版本的十六进制报文后，服务按位解析、验证校验和，并返回字段值、位偏移及实际分支路径；反向地，也可以提交字段值**编码**出十六进制报文（校验和自动计算写入）。对于串口/TCP 式的**分块字节流**，还可以提交十六进制分块数组，由同步头与长度字段自动分帧、跨块重组、剔除噪声并逐帧解析。此外支持保存**解析回归样例**：把报文与基线字段快照存入 SQLite，版本升级后对新版本重跑并逐字段比对差异。SQLite 持久化，启动时自动建表。
 
 ## 快速启动
 
@@ -80,6 +80,7 @@ docker compose up --build
 | POST | `/api/v1/definitions/{device_type}/{version}/deactivate` | 停用定义 |
 | POST | `/api/v1/definitions/{device_type}/compatibility` | 两个已注册版本的报文布局兼容性分析（>256 个等价类组合或任一版本含 `repeat` 定义返回 422） |
 | POST | `/api/v1/parse` | 解析报文（`version` 缺省时使用最新启用版本） |
+| POST | `/api/v1/stream/parse` | 字节流分帧：按同步头 + 无符号长度字段从十六进制分块中重组并逐帧解析 |
 | POST | `/api/v1/detect` | 不传版本，用全部已注册版本（含停用）逐一解析以自动识别版本 |
 | POST | `/api/v1/encode` | 反向编码：由字段值生成报文（版本选择规则同 parse） |
 | POST | `/api/v1/fixtures` | 保存带名称的解析回归样例（名称在**设备类型内**唯一，重复返回 409） |
@@ -406,7 +407,92 @@ curl -X POST http://localhost:8000/api/v1/detect \
 
 > 设备类型下没有任何注册版本（含停用）时返回 `404`；hex 非法/为空返回 `422`，清洗规则与 `/parse` 一致（忽略空白、`_`、`-` 与 `0x` 前缀）。
 
-### 8. 解析回归样例（/fixtures）
+### 8. 字节流分帧解析（/stream/parse）
+
+串口 / TCP 收到的原始字节通常是**任意分块**的，还可能夹杂线路噪声、损坏帧和被分块边界切断的半帧。`/api/v1/stream/parse` 在按位解析器之上叠加一层**字节流分帧器**：按 `chunks` 顺序维护跨块缓冲，用同步字节定位帧头，按帧内无符号长度字段切出整帧后再交给现有解析器。
+
+**请求参数**
+
+| 参数 | 说明 |
+| ---- | ---- |
+| `device_type` / `version` | 版本选择规则与 `/parse` 一致（`version` 缺省取最新启用版本） |
+| `sync_hex` | 帧头同步字节（一或多字节），如 `"aa55"`；支持跨块匹配（`…aa` 与 `55…` 分两块到达也能识别） |
+| `length_field_offset` | 长度字段相对同步头的字节偏移（≥0） |
+| `length_field_bytes` | 无符号长度字段宽度（1～8 字节） |
+| `length_endianness` | 长度字段端序：`big`（默认）/ `little` |
+| `length_adjustment` | 有符号修正值（默认 0），用于长度值不直接等于帧长的协议 |
+| `chunks` | 十六进制字符串数组，**按到达顺序**给出；一帧可以横跨多个分块 |
+
+从同步头起算的**总帧长**（字节）为：
+
+```
+total = length_field_offset + length_field_bytes + length_value + length_adjustment
+```
+
+即长度值默认表示「长度字段之后的字节数」；若协议长度字段从其自身末尾起算（Netty 风格），传负的 `length_adjustment`（如长度字段在偏移 1、宽 2 且长度值含整个帧头时，`length_adjustment = -3`）。
+
+**分帧与重同步行为**
+
+- **跨块缓冲**：同步头、长度字段或帧体被分块切断时自动拼接，帧完整前不解析、不报错。
+- **噪声**：同步头之前的字节作为 `noise` 丢弃（包括尾部恰好无法构成同步头的同步起始字节）。
+- **非法长度**：长度值加修正后短于帧头本身（如为负）时丢弃该候选同步字节并继续寻找下一个同步头。
+- **解析 / 校验失败**：整帧到达后交给现有解析器；报文过短、解析失败、校验字段被分支跳过、校验和不符或定义未完整消费帧（存在尾部位）时，**逐字节重同步**——只丢弃该候选同步字节，从下一个同步头重试，避免一个坏帧导致整流失联。
+- **末尾未完成帧不是错误**：最后一个分块处理完后仍滞留的字节（半帧或半个同步头）通过 `incomplete_hex` 返回，调用方可在后续请求中续传（本接口为无状态单次重组，续传需调用方自行拼接后重发）。
+- **硬性上限**：滞留的未分帧缓冲超过 **1 MiB**，或长度字段声明的单帧超过 **64 KiB**，返回 `422`（这类情况无法安全缓冲，不做静默丢弃）。
+
+> 分帧以**字节**为粒度：被选定义必须完整消费整帧（`trailing_bits = 0`），否则该帧会被判为坏帧触发重同步；非字节对齐（位级）的报文定义不适用于字节长度分帧。
+
+**响应**
+
+- `frames[]`：每帧含相对拼接字节流的原始半开区间偏移 `start` / `end`、`length`、原始 `hex`，以及与 `/parse` 完全一致的 `result`（字段、分支、校验结果等）。
+- `discarded_ranges[]`：每个被丢弃区间含 `start` / `end` / `length` / `hex`、`reason`（`noise` / `invalid_length` / `parse_error` / `checksum`）及 `detail`。
+- `incomplete_hex` / `incomplete_bytes`：末尾滞留的未完成字节（为空串表示流恰好在帧边界结束）。
+- 另有 `received_bytes`、`frame_count`、`discarded_count`、`discarded_bytes` 与 `limits` 汇总。
+
+示例协议：`AA | len(1B) | seq(1B) | temperature(2B) | xor8(1B)`，长度字段计长度字段之后的字节（恒为 4），总帧长 6：
+
+```bash
+curl -X POST http://localhost:8000/api/v1/stream/parse \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "device_type": "stream_dev",
+    "version": "1.0.0",
+    "sync_hex": "aa",
+    "length_field_offset": 1,
+    "length_field_bytes": 1,
+    "length_endianness": "big",
+    "length_adjustment": 0,
+    "chunks": ["1234aa040100", "19b6aa0402ffff"]
+  }'
+```
+
+上例中一帧被分块切断（`aa040100 | 19b6`），前导 `1234` 是噪声；响应（节选）：
+
+```json
+{
+  "device_type": "stream_dev",
+  "version": "1.0.0",
+  "received_bytes": 13,
+  "frame_count": 1,
+  "frames": [
+    {"start": 2, "end": 8, "length": 6, "hex": "aa04010019b6",
+     "result": {"fields": [{"name": "seq", "value": 1}, {"name": "temperature", "value": 25}],
+                "checksum": {"valid": true}}}
+  ],
+  "discarded_count": 1,
+  "discarded_bytes": 2,
+  "discarded_ranges": [
+    {"start": 0, "end": 2, "length": 2, "hex": "1234", "reason": "noise", "detail": null}
+  ],
+  "incomplete_bytes": 5,
+  "incomplete_hex": "aa0402ffff",
+  "limits": {"max_buffer_bytes": 1048576, "max_frame_bytes": 65536}
+}
+```
+
+> 第二个分块尾部 `aa0402ffff` 是尚未收完（缺 1 字节校验位）的帧，计入 `incomplete_hex` 而**不**返回错误。`chunks` 为空列表是合法的空流（200，无帧无丢弃）；某个分块 hex 非法时返回 `422` 并在 `detail` 中标注下标（如 `chunks[1]: …`），整个请求不会产生部分分帧结果。
+
+### 9. 解析回归样例（/fixtures）
 
 报文定义升级后，需要确认同一批历史报文在新版本上的解析表现。回归样例把一条报文与它在某个版本上的**字段快照**绑定存储（SQLite），随后可对任意目标版本（或默认的基线版本）重跑，逐字段比较：
 
@@ -549,6 +635,7 @@ app/
   schemas.py    # 请求模型与定义语义校验
   parser.py     # 按位解析器（位读取、条件分支、repeat 数组展开、校验和验证）
   encoder.py    # 按位编码器（位写入、scale/offset 反算、repeat 数组、校验和自动写入）
+  framing.py    # 字节流分帧（同步头 + 长度字段、跨块缓冲、逐字节重同步、1 MiB/64 KiB 上限）
   analyzer.py   # 版本兼容性分析（条件等价类划分、可达分支枚举、布局比对；遇 repeat 拒绝分析）
   fixtures.py   # 回归样例：基线快照捕获、expect 断言、逐字段 added/removed/changed 比较
   checksum.py   # sum8 / xor8 / crc16-ccitt / crc16-modbus

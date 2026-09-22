@@ -5,7 +5,18 @@ os.environ["DB_PATH"] = os.path.join(tempfile.mkdtemp(prefix="parser-test-"), "t
 
 from fastapi.testclient import TestClient  # noqa: E402
 
-from app.checksum import crc16_ccitt  # noqa: E402
+from app.checksum import crc16_ccitt, xor8  # noqa: E402
+from app.framing import (  # noqa: E402
+    MAX_BUFFER_SIZE,
+    FrameSpec,
+    FramingError,
+    REASON_CHECKSUM,
+    REASON_INVALID_LENGTH,
+    REASON_NOISE,
+    REASON_PARSE_ERROR,
+    RejectFrame,
+    StreamFramer,
+)
 from app.main import app  # noqa: E402
 
 client = TestClient(app)
@@ -1901,3 +1912,525 @@ def test_fixture_snapshot_covers_bool_and_repeated_fields():
     assert resp.status_code == 200
     assert resp.json()["passed"] is True
     assert resp.json()["comparison"]["pass_rate"] == 1.0
+
+
+# ------------------------------------------------------- byte-stream framing --
+
+
+# Wire frame for stream_dev:
+#   AA | length(1B, big) | seq(1B) | temperature(2B, big) | xor8(1B)
+# length counts the bytes after the length field (seq + temp + xor = 4),
+# so length_field_offset=1, length_field_bytes=1, length_adjustment=0 and
+# the total frame length is 2 (sync+length) + length value = 6.
+STREAM_DEF = {
+    "device_type": "stream_dev",
+    "version": "1.0.0",
+    "fields": [
+        {"name": "sync", "type": "uint", "bit_length": 8},
+        {"name": "length", "type": "uint", "bit_length": 8},
+        {"name": "seq", "type": "uint", "bit_length": 8},
+        {"name": "temperature", "type": "int", "bit_length": 16},
+        {"name": "xor", "type": "uint", "bit_length": 8},
+    ],
+    "checksum": {"field": "xor", "algorithm": "xor8"},
+}
+
+STREAM_PARAMS = {
+    "sync_hex": "aa",
+    "length_field_offset": 1,
+    "length_field_bytes": 1,
+    "length_endianness": "big",
+    "length_adjustment": 0,
+}
+
+
+def _stream_frame(seq: int, temperature: int) -> bytes:
+    # post-length bytes: seq(1) + temperature(2) + xor(1) = 4; total 6
+    body = bytes([0xAA, 4, seq]) + temperature.to_bytes(2, "big", signed=True)
+    return body + bytes([xor8(body)])
+
+
+def _stream_request(chunks, **overrides):
+    payload = {"device_type": "stream_dev", "version": "1.0.0",
+               **STREAM_PARAMS, "chunks": list(chunks)}
+    payload.update(overrides)
+    return client.post("/api/v1/stream/parse", json=payload)
+
+
+def test_stream_register():
+    resp = client.post("/api/v1/definitions", json=STREAM_DEF)
+    assert resp.status_code == 201, resp.text
+
+
+def test_stream_single_frame_one_chunk():
+    frame = _stream_frame(1, 25)
+    resp = _stream_request([frame.hex()])
+    assert resp.status_code == 200, resp.text
+    data = resp.json()
+    assert data["frame_count"] == 1
+    assert data["received_bytes"] == len(frame)
+    fr = data["frames"][0]
+    assert (fr["start"], fr["end"], fr["length"]) == (0, 6, 6)
+    assert fr["hex"] == frame.hex()
+    fields = {f["name"]: f for f in fr["result"]["fields"]}
+    assert fields["seq"]["value"] == 1
+    assert fields["temperature"]["value"] == 25
+    assert fr["result"]["checksum"]["valid"] is True
+    assert data["discarded_ranges"] == []
+    assert data["discarded_bytes"] == 0
+    assert data["incomplete_hex"] == ""
+    assert data["incomplete_bytes"] == 0
+
+
+def test_stream_multiple_frames_with_offsets():
+    f1 = _stream_frame(0, 100)
+    f2 = _stream_frame(1, -5)
+    noise = bytes([0x12, 0x34])
+    stream = noise + f1 + noise + f2
+    resp = _stream_request([stream.hex()])
+    assert resp.status_code == 200, resp.text
+    data = resp.json()
+    assert data["frame_count"] == 2
+    assert [(f["start"], f["end"]) for f in data["frames"]] == [
+        (2, 8), (10, 16),
+    ]
+    fields1 = {f["name"]: f for f in data["frames"][0]["result"]["fields"]}
+    fields2 = {f["name"]: f for f in data["frames"][1]["result"]["fields"]}
+    assert fields1["temperature"]["value"] == 100
+    assert fields2["temperature"]["value"] == -5
+    discarded = data["discarded_ranges"]
+    assert [(d["start"], d["end"], d["hex"]) for d in discarded] == [
+        (0, 2, "1234"),
+        (8, 10, "1234"),
+    ]
+    assert all(d["reason"] == REASON_NOISE for d in discarded)
+    assert data["discarded_bytes"] == 4
+    assert data["incomplete_hex"] == ""
+
+
+def test_stream_frame_split_across_chunks():
+    frame = _stream_frame(7, 200)
+    # split at every byte position; also feed the sync byte alone first
+    pieces = [frame[i:i + 1].hex() for i in range(len(frame))]
+    resp = _stream_request(pieces)
+    assert resp.status_code == 200, resp.text
+    data = resp.json()
+    assert data["frame_count"] == 1
+    assert (data["frames"][0]["start"], data["frames"][0]["end"]) == (0, 6)
+    assert data["incomplete_hex"] == ""
+
+    # frame split in the middle of the length/body boundary, across two chunks
+    resp = _stream_request([frame[:3].hex(), frame[3:].hex()])
+    assert resp.status_code == 200
+    assert resp.json()["frames"][0]["hex"] == frame.hex()
+
+
+def _register_stream_marker():
+    client.post("/api/v1/definitions", json={
+        "device_type": "stream_marker",
+        "version": "1.0.0",
+        "fields": [
+            {"name": "s1", "type": "uint", "bit_length": 8},
+            {"name": "s2", "type": "uint", "bit_length": 8},
+            {"name": "length", "type": "uint", "bit_length": 8},
+            {"name": "a", "type": "uint", "bit_length": 8},
+            {"name": "b", "type": "uint", "bit_length": 8},
+            {"name": "c", "type": "uint", "bit_length": 8},
+        ],
+    })
+
+
+def test_stream_sync_marker_split_across_chunks():
+    # Two-byte sync "AABB" straddles chunks: ...AA | BB...
+    # The definition covers the whole framed message (sync + length + body):
+    # aabb sync, 1-byte length=3 counting post-length bytes, then 3 bytes.
+    _register_stream_marker()
+    payload = {
+        "device_type": "stream_marker",
+        "version": "1.0.0",
+        "sync_hex": "aabb",
+        "length_field_offset": 2,
+        "length_field_bytes": 1,
+        "length_endianness": "big",
+        "length_adjustment": 0,
+        "chunks": ["77aa", "bb03112233"],
+    }
+    resp = client.post("/api/v1/stream/parse", json=payload)
+    assert resp.status_code == 200, resp.text
+    data = resp.json()
+    # header 3 bytes (aabb + len=3) + 3 body bytes = 6 bytes, at offset 1
+    assert data["frame_count"] == 1
+    fr = data["frames"][0]
+    assert fr["start"] == 1  # leading 77 discarded
+    assert fr["hex"] == "aabb03112233"
+    assert data["discarded_ranges"][0]["hex"] == "77"
+    fields = {f["name"]: f for f in fr["result"]["fields"]}
+    assert fields["a"]["value"] == 0x11
+    assert fields["c"]["value"] == 0x33
+
+
+def test_stream_trailing_partial_frame_is_incomplete_not_error():
+    frame = _stream_frame(3, 10)
+    resp = _stream_request([frame[:5].hex()])
+    assert resp.status_code == 200, resp.text
+    data = resp.json()
+    assert data["frame_count"] == 0
+    assert data["frames"] == []
+    assert data["incomplete_hex"] == frame[:5].hex()
+    assert data["incomplete_bytes"] == 5
+
+    # noise before the partial frame is still discarded
+    resp = _stream_request(["ff" + frame[:5].hex()])
+    data = resp.json()
+    assert data["frame_count"] == 0
+    assert data["incomplete_hex"] == frame[:5].hex()
+    assert data["discarded_ranges"][0] == {
+        "start": 0, "end": 1, "length": 1, "hex": "ff",
+        "reason": REASON_NOISE, "detail": None,
+    }
+
+    # partial sync marker alone at the tail is retained too
+    resp = _stream_request(["ffaa"])
+    data = resp.json()
+    assert data["incomplete_hex"] == "aa"
+
+
+def test_stream_corrupt_checksum_resyncs_one_byte():
+    good = _stream_frame(1, 50)
+    bad = bytearray(_stream_frame(2, 60))
+    bad[-1] ^= 0xFF  # flip checksum byte
+    stream = bytes(bad) + good
+    resp = _stream_request([stream.hex()])
+    assert resp.status_code == 200, resp.text
+    data = resp.json()
+    assert data["frame_count"] == 1
+    fr = data["frames"][0]
+    assert fr["start"] == 6
+    fields = {f["name"]: f for f in fr["result"]["fields"]}
+    assert fields["seq"]["value"] == 1
+    # all 6 bytes of the corrupt frame were rejected byte by byte; the first
+    # record is the bad sync byte flagged with the checksum reason
+    discarded = data["discarded_ranges"]
+    assert sum(d["end"] - d["start"] for d in discarded) == 6
+    assert discarded[0]["start"] == 0
+    assert discarded[0]["reason"] == REASON_CHECKSUM
+    assert "checksum mismatch" in discarded[0]["detail"]
+    assert data["incomplete_hex"] == ""
+
+
+def test_stream_illegal_length_resyncs():
+    # A negative adjustment lets a zero length yield a frame shorter than its
+    # own header: frame_len = 2 + 0 - 1 = 1 < 2 header bytes. A valid frame
+    # under the same spec carries length byte 5 (2 + 5 - 1 = 6 total), so
+    # build one by hand with the adjusted length byte.
+    body = bytes([0xAA, 5, 9]) + (1).to_bytes(2, "big", signed=True)
+    good = body + bytes([xor8(body)])
+    bad = bytes.fromhex("aa0011")
+    resp = _stream_request(
+        [(bad + good).hex()], length_adjustment=-1
+    )
+    assert resp.status_code == 200, resp.text
+    data = resp.json()
+    assert data["frame_count"] == 1
+    assert data["frames"][0]["start"] == 3
+    first = data["discarded_ranges"][0]
+    assert (first["start"], first["end"]) == (0, 1)
+    assert first["reason"] == REASON_INVALID_LENGTH
+    assert "illegal frame length" in first["detail"]
+    # after dropping the bad AA, "0011" is noise up to the next sync
+    assert [(d["start"], d["end"]) for d in data["discarded_ranges"][1:]] == [(1, 3)]
+
+
+def test_stream_zero_payload_frame_is_rejected_by_parser():
+    # length=0 with no adjustment declares a 2-byte frame: the framer accepts
+    # the length, but the definition needs 7 bytes -> parse rejection resync.
+    bad = bytes.fromhex("aa00")
+    good = _stream_frame(8, 2)
+    resp = _stream_request([(bad + good).hex()])
+    assert resp.status_code == 200, resp.text
+    data = resp.json()
+    assert data["frame_count"] == 1
+    assert data["frames"][0]["start"] == 2
+    first = data["discarded_ranges"][0]
+    assert (first["start"], first["end"]) == (0, 1)
+    assert first["reason"] == REASON_PARSE_ERROR
+    assert "too short" in first["detail"]
+
+
+def test_stream_parse_failure_resyncs_on_next_sync():
+    # length=2 declares a 4-byte frame but stream_dev fields need 7 bytes:
+    # the candidate arrives complete (frame_len bytes present), the parser
+    # fails with "message too short", so the sync byte is rejected and the
+    # framer resyncs to the following valid frame.
+    bogus = bytes([0xAA, 2, 0x01, 0x00])  # 4 bytes, too short for 7-byte def
+    good = _stream_frame(4, -40)
+    resp = _stream_request([(bogus + good).hex()])
+    assert resp.status_code == 200, resp.text
+    data = resp.json()
+    assert data["frame_count"] == 1
+    assert data["frames"][0]["start"] == 4
+    first = data["discarded_ranges"][0]
+    assert (first["start"], first["end"]) == (0, 1)
+    assert first["reason"] == REASON_PARSE_ERROR
+    assert "too short" in first["detail"]
+    # bytes 1..3 are noise between the rejected sync and the next one
+    assert [(d["start"], d["end"], d["reason"]) for d in data["discarded_ranges"][1:]] == [
+        (1, 4, REASON_NOISE),
+    ]
+
+    # a short candidate still in transit is not rejected: it stays buffered
+    waiting = bytes([0xAA, 4, 1, 0x00, 0x00])  # 5 bytes of a 6-byte frame
+    resp = _stream_request([waiting.hex()])
+    assert resp.status_code == 200
+    data = resp.json()
+    assert data["frame_count"] == 0
+    assert data["incomplete_hex"] == waiting.hex()
+
+
+def test_stream_trailing_bits_frame_rejected():
+    # A definition whose fields end before the declared frame length leaves
+    # trailing bits: the stream_marker device (sync 2 + length 1 + body 3 =
+    # 6 bytes), so declaring length=4 (a 7-byte frame) leaves 8 trailing
+    # bits -> the candidate is rejected and resync proceeds one byte at a
+    # time. A trailing byte follows so it cannot stay "incomplete".
+    _register_stream_marker()
+    payload = {
+        "device_type": "stream_marker",
+        "version": "1.0.0",
+        "sync_hex": "aabb",
+        "length_field_offset": 2,
+        "length_field_bytes": 1,
+        "length_endianness": "big",
+        "length_adjustment": 0,
+        "chunks": ["aabb0411223344ff"],  # 7-byte candidate + trailing noise
+    }
+    resp = client.post("/api/v1/stream/parse", json=payload)
+    assert resp.status_code == 200, resp.text
+    data = resp.json()
+    assert data["frame_count"] == 0
+    first = data["discarded_ranges"][0]
+    assert (first["start"], first["end"]) == (0, 1)  # sync byte rejected
+    assert "trailing bit" in first["detail"]
+
+
+def test_stream_length_endianness_and_adjustment():
+    # little-endian 2-byte length field counting the *whole* frame:
+    # sync=AA, length at [1,3), total = raw + adjustment(0... need raw==total)
+    # frame_len = 3 + raw + adj; to make raw==total use adj=-3.
+    device = "stream_le"
+    assert client.post("/api/v1/definitions", json={
+        "device_type": device,
+        "version": "1.0.0",
+        "fields": [
+            {"name": "sync", "type": "uint", "bit_length": 8},
+            {"name": "length", "type": "uint", "bit_length": 16, "endianness": "little"},
+            {"name": "v", "type": "uint", "bit_length": 16},
+        ],
+    }).status_code == 201
+    body = bytes([0xAA]) + (5).to_bytes(2, "little") + (0x1234).to_bytes(2, "big")
+    resp = client.post("/api/v1/stream/parse", json={
+        "device_type": device,
+        "version": "1.0.0",
+        "sync_hex": "aa",
+        "length_field_offset": 1,
+        "length_field_bytes": 2,
+        "length_endianness": "little",
+        "length_adjustment": -3,
+        "chunks": ["00", body.hex()],
+    })
+    assert resp.status_code == 200, resp.text
+    data = resp.json()
+    assert data["frame_count"] == 1
+    assert (data["frames"][0]["start"], data["frames"][0]["end"]) == (1, 6)
+    fields = {f["name"]: f for f in data["frames"][0]["result"]["fields"]}
+    assert fields["v"]["value"] == 0x1234
+    assert data["discarded_ranges"][0]["hex"] == "00"
+
+
+def test_stream_noise_repeating_sync_start_bytes():
+    # multi-byte marker AABB: stray AA bytes that never get their BB are
+    # noise; a partial AA at the very tail is retained as incomplete.
+    _register_stream_marker()
+    resp = client.post("/api/v1/stream/parse", json={
+        "device_type": "stream_marker",
+        "version": "1.0.0",
+        "sync_hex": "aabb",
+        "length_field_offset": 2,
+        "length_field_bytes": 1,
+        "length_endianness": "big",
+        "length_adjustment": 0,
+        # AA AA (both stray) | AABB 03 112233 | trailing AA (partial marker)
+        "chunks": ["aaaaaabb03112233aa"],
+    })
+    assert resp.status_code == 200, resp.text
+    data = resp.json()
+    assert data["frame_count"] == 1
+    assert data["frames"][0]["hex"] == "aabb03112233"
+    assert data["frames"][0]["start"] == 2
+    # the two stray AAs before the marker are noise; trailing AA incomplete
+    assert [(d["start"], d["end"], d["hex"]) for d in data["discarded_ranges"]] == [
+        (0, 2, "aaaa"),
+    ]
+    assert data["incomplete_hex"] == "aa"
+
+
+def test_stream_length_endianness_defaults_to_big():
+    # omitting length_endianness must parse a big-endian length
+    frame = _stream_frame(6, 300)
+    resp = client.post("/api/v1/stream/parse", json={
+        "device_type": "stream_dev",
+        "version": "1.0.0",
+        "sync_hex": "aa",
+        "length_field_offset": 1,
+        "length_field_bytes": 1,
+        "chunks": [frame.hex()],
+    })
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["frame_count"] == 1
+
+
+def test_stream_defaults_to_latest_active_version():
+    # register a byte-compatible 2.0.0 (same wire layout); without version
+    # the latest active one must be used.
+    v2 = dict(STREAM_DEF, version="2.0.0", description="latest")
+    assert client.post("/api/v1/definitions", json=v2).status_code == 201
+    frame = _stream_frame(1, 25)
+    resp = client.post("/api/v1/stream/parse", json={
+        "device_type": "stream_dev",
+        **STREAM_PARAMS,
+        "chunks": [frame.hex()],
+    })
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["version"] == "2.0.0"
+
+    # explicit version still selects the older one
+    resp = _stream_request([frame.hex()])
+    assert resp.json()["version"] == "1.0.0"
+
+
+def test_stream_empty_chunks_is_valid_empty_stream():
+    resp = _stream_request([])
+    assert resp.status_code == 200, resp.text
+    data = resp.json()
+    assert data["frames"] == []
+    assert data["discarded_ranges"] == []
+    assert data["incomplete_hex"] == ""
+    assert data["received_bytes"] == 0
+    assert data["limits"] == {"max_buffer_bytes": 1024 * 1024, "max_frame_bytes": 64 * 1024}
+
+
+def test_stream_hex_cleaning_matches_parse():
+    frame = _stream_frame(5, 7)
+    messy = "0x" + "_".join(
+        frame.hex()[i:i + 2] for i in range(0, len(frame.hex()), 2)
+    )
+    resp = _stream_request([messy])
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["frame_count"] == 1
+
+
+def test_stream_invalid_chunk_hex_422():
+    resp = _stream_request(["zz"])
+    assert resp.status_code == 422
+    assert "chunks[0]" in resp.json()["detail"]
+
+    resp = _stream_request(["aa", ""])
+    assert resp.status_code == 422
+    assert "chunks[1]" in resp.json()["detail"]
+
+    resp = _stream_request(["abcd"], sync_hex="zz")
+    assert resp.status_code == 422
+
+
+def test_stream_unknown_device_404():
+    resp = client.post("/api/v1/stream/parse", json={
+        "device_type": "ghost", **STREAM_PARAMS, "chunks": ["aa"],
+    })
+    assert resp.status_code == 404
+
+
+def test_stream_request_validation_422():
+    base = {"device_type": "stream_dev", **STREAM_PARAMS, "chunks": []}
+
+    def post(**kw):
+        body = dict(base)
+        body.update(kw)
+        return client.post("/api/v1/stream/parse", json=body)
+
+    assert post(length_field_bytes=0).status_code == 422
+    assert post(length_field_bytes=9).status_code == 422
+    assert post(length_field_offset=-1).status_code == 422
+    assert post(length_endianness="middle").status_code == 422
+    assert post(length_adjustment=2 ** 32).status_code == 422
+    # unknown body fields are rejected
+    assert post(extra=1).status_code == 422
+    # length field beyond the 64 KiB frame cap
+    assert post(length_field_offset=64 * 1024, length_field_bytes=1).status_code == 422
+
+
+def test_stream_declared_frame_over_64kib_422():
+    # 2-byte big-endian length with adjustment so frame_len = 3 + 65534 - 1
+    # = 65536 exactly is allowed (waits for bytes); one more triggers 422.
+    header_ok = bytes([0xAA]) + (65534).to_bytes(2, "big")
+    header_big = bytes([0xAA]) + (65535).to_bytes(2, "big")
+    common = {
+        "device_type": "stream_dev",
+        "sync_hex": "aa",
+        "length_field_offset": 1,
+        "length_field_bytes": 2,
+        "length_endianness": "big",
+        "length_adjustment": -1,  # frame_len = 3 + raw - 1
+    }
+    resp = client.post("/api/v1/stream/parse", json={**common, "chunks": [header_ok.hex()]})
+    assert resp.status_code == 200
+    assert resp.json()["incomplete_bytes"] == 3  # held waiting for the body
+
+    resp = client.post("/api/v1/stream/parse", json={**common, "chunks": [header_big.hex()]})
+    assert resp.status_code == 422
+    assert "65536" in resp.json()["detail"]
+
+
+# ------------------------------------------------- framer unit-level behavior --
+
+
+def _echo_framer(**spec_kw):
+    return StreamFramer(
+        FrameSpec(sync=b"\xAA", length_field_offset=1, length_field_bytes=1,
+                  length_endianness="big", length_adjustment=0, **spec_kw),
+        validate=lambda data: data,
+    )
+
+
+def test_framer_buffer_limit_raises_framing_error():
+    # offset beyond the buffer limit: the header can never complete, so the
+    # retained sync + zeros accumulate until the 1 MiB cap.
+    framer = StreamFramer(
+        FrameSpec(sync=b"\xAB", length_field_offset=MAX_BUFFER_SIZE + 16,
+                  length_field_bytes=1, length_endianness="big",
+                  length_adjustment=0),
+        validate=lambda data: data,
+    )
+    try:
+        framer.feed(b"\xAB" + b"\x00" * MAX_BUFFER_SIZE)
+    except FramingError:
+        pass
+    else:  # pragma: no cover - defensive
+        raise AssertionError("buffer limit must raise FramingError")
+
+
+def test_framer_callback_reject_reason_is_preserved():
+    def validate(data):
+        raise RejectFrame("nope", reason=REASON_CHECKSUM)
+
+    framer = StreamFramer(
+        FrameSpec(sync=b"\xAA", length_field_offset=1, length_field_bytes=1,
+                  length_endianness="big", length_adjustment=0),
+        validate=validate,
+    )
+    framer.feed(bytes.fromhex("aa01") + b"x")
+    assert framer.frames == []
+    assert framer.discarded[0].reason == REASON_CHECKSUM
+    assert framer.discarded[0].detail == "nope"
+    # one-byte resync: only the sync byte was attributed to the rejection
+    assert (framer.discarded[0].start, framer.discarded[0].end) == (0, 1)
+
